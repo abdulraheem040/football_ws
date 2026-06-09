@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="robot_blue">
+  <xacro:property name="robot_color" value="blue"/>
+  <xacro:property name="skin_color" value="white"/>
+  <xacro:property name="robot_name" value="robot_blue"/>
+  <xacro:include filename="$(find humanoid_football)/urdf/humanoid_robot.xacro"/>
+</robot>
