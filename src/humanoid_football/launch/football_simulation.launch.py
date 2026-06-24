@@ -89,7 +89,7 @@ def generate_launch_description():
                     '-file', robot_blue_urdf_file,
                     '-x', '-3.0',
                     '-y', '0.0',
-                    '-z', '0.45',
+                    '-z', '0.51',
                     '-Y', '1.57'
                 ],
                 output='screen'
@@ -109,7 +109,7 @@ def generate_launch_description():
                     '-file', robot_red_urdf_file,
                     '-x', '3.0',
                     '-y', '0.0',
-                    '-z', '0.45',
+                    '-z', '0.51',
                     '-Y', '-1.57'
                 ],
                 output='screen'

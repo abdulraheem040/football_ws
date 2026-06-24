@@ -52,11 +52,15 @@
 
       <mass value="5.0"/>
 
+      <!-- Huge roll/pitch inertia (ixx, iyy) makes the body un-tippable:
+           planar_move sets velocity directly, so this does NOT affect driving,
+           but it makes contact impulses (robot-robot rams, ball hits) produce
+           negligible tilt before the plugin zeroes roll/pitch each step. -->
       <inertia
-        ixx="0.15"
+        ixx="100.0"
         ixy="0.0"
         ixz="0.0"
-        iyy="0.15"
+        iyy="100.0"
         iyz="0.0"
         izz="0.15"/>
     </inertial>
@@ -84,15 +88,16 @@
     </collision>
 
     <inertial>
-      <mass value="1.0"/>
+      <!-- Light head keeps the center of mass low for stability -->
+      <mass value="0.4"/>
 
       <inertia
-        ixx="0.01"
+        ixx="0.004"
         ixy="0"
         ixz="0"
-        iyy="0.01"
+        iyy="0.004"
         iyz="0"
-        izz="0.01"/>
+        izz="0.004"/>
     </inertial>
 
   </link>
@@ -176,7 +181,7 @@
     </collision>
 
     <inertial>
-      <mass value="2.0"/>
+      <mass value="3.0"/>
 
       <inertia
         ixx="0.02"
@@ -266,7 +271,7 @@
     </collision>
 
     <inertial>
-      <mass value="2.0"/>
+      <mass value="3.0"/>
 
       <inertia
         ixx="0.02"
@@ -312,7 +317,10 @@
     <plugin name="${robot_name}_planar_move"
             filename="libgazebo_ros_planar_move.so">
 
-      <update_rate>50</update_rate>
+      <!-- Run every physics step (1 kHz). The plugin holds roll/pitch/z by
+           zeroing them each update; at a low rate the body drifts between
+           updates and topples, so this must match the physics rate. -->
+      <update_rate>1000</update_rate>
 
       <command_topic>cmd_vel</command_topic>
 

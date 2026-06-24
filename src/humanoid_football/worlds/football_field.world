@@ -46,6 +46,15 @@
       <direction>-0.5 0.1 -0.9</direction>
     </light>
 
+    <!-- Gazebo ROS state plugin: publishes /gazebo/model_states and
+         provides the /gazebo/set_entity_state service used by the controllers -->
+    <plugin name='gazebo_ros_state' filename='libgazebo_ros_state.so'>
+      <ros>
+        <namespace>/gazebo</namespace>
+      </ros>
+      <update_rate>10.0</update_rate>
+    </plugin>
+
     <!-- Ground Plane -->
     <model name='ground_plane'>
       <static>1</static>

@@ -3,439 +3,350 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
 from gazebo_msgs.msg import ModelStates
+from std_msgs.msg import Bool
 from rclpy.executors import MultiThreadedExecutor
 import math
 import random
 
 
+def normalize_angle(a):
+    """Wrap an angle to [-pi, pi]."""
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
 class RobotController(Node):
+    """Autonomous striker: get behind the ball, then drive it into the
+    OPPONENT's goal (never its own).
+
+    All poses come from the world-frame /gazebo/model_states topic so the
+    geometry is consistent. Velocities are slew-rate limited for smooth,
+    stable motion. The robot detects when it is stuck and performs an escape
+    maneuver, and freezes when ball_controller announces game over.
+    """
 
     def __init__(self, robot_name='robot'):
-
         super().__init__(f'{robot_name}_controller')
 
         self.robot_name = robot_name
+        self.opponent_name = (
+            'robot_red' if robot_name == 'robot_blue' else 'robot_blue'
+        )
 
-        # Robot pose
+        # World-frame pose, filled from /gazebo/model_states
         self.current_x = 0.0
         self.current_y = 0.0
         self.current_yaw = 0.0
+        self.have_pose = False
 
-        # Ball pose
         self.ball_x = 0.0
         self.ball_y = 0.0
+        self.have_ball = False
 
-        # Ball detection
-        self.ball_detected = False
-        self.ball_distance = 0.0
-        self.ball_angle = 0.0
-
-        # Opponent robot pose
         self.opponent_x = 0.0
         self.opponent_y = 0.0
         self.opponent_detected = False
 
-        # Goal positions - kick to opposite goal
+        # Remember BOTH goals. Attack the opponent's goal; protect, and never
+        # shoot at, the own goal. Must agree with ball_controller scoring:
+        #   ball in right goal (x > 9.5)  -> Blue scores
+        #   ball in left  goal (x < -9.5) -> Red scores
         if robot_name == 'robot_blue':
-            self.target_goal_x = -10.0
+            self.target_goal_x = 10.0    # opponent goal (right)
+            self.own_goal_x = -10.0      # own goal (left)
         else:
-            self.target_goal_x = 10.0
-
+            self.target_goal_x = -10.0   # opponent goal (left)
+            self.own_goal_x = 10.0       # own goal (right)
         self.target_goal_y = 0.0
 
-        # =========================================================
-        # NEW: KICK STATE MACHINE
-        # =========================================================
-        # States: 'approaching', 'positioning', 'ready_to_kick', 'kicking', 'cooldown', 'carrying'
-        self.kick_state = 'approaching'
-        self.kick_timer = 0
-        self.kick_cooldown = 0
-        self.carry_timer = 0
-        self.carry_angle = 0.0
+        # --- Per-robot "personality" (random; the two robots play
+        #     differently each run). Speeds kept moderate for stability. ---
+        self.aggression = random.uniform(0.0, 1.0)
+        self.base_linear = lerp(1.1, 2.0, self.aggression)
+        self.base_angular = lerp(2.2, 3.4, self.aggression)
+        self.base_strike = lerp(1.8, 3.0, self.aggression)
+        self.approach_offset = lerp(0.70, 0.45, self.aggression)
 
-        # Random speed parameters for varied gameplay possibilities
-        # Linear speed: 0.5 to 2.0 m/s
-        self.linear_speed = random.uniform(0.5, 2.0)
-        # Angular speed: 0.8 to 2.5 rad/s
-        self.angular_speed = random.uniform(0.8, 2.5)
-        # Kick speed: 0.6 to 1.8 m/s
-        self.kick_speed = random.uniform(0.6, 1.8)
-        
-        self.get_logger().info(
-            f'{robot_name} speeds - Linear: {self.linear_speed:.2f}, '
-            f'Angular: {self.angular_speed:.2f}, Kick: {self.kick_speed:.2f}'
-        )
+        # Tunables
+        self.strike_distance = 1.2
+        self.strike_align = 0.35
 
-        # Positioning tolerances (must center before kick)
-        self.angle_tolerance = 0.1  # radians (~5.7 degrees)
-        self.distance_tolerance = 0.3  # meters
+        # --- Dynamic pacing ---
+        self.burst_mult = 1.0
+        self.burst_ticks = 0
+        self.kick_power = self.base_strike
+        self.mode = 'seek'
+        self.seek_ticks = 0      # how long we've been chasing without a strike
+        self.charge_ticks = 0    # active "charge the ball" burst
 
-        # Publisher
+        # --- Smoothing: slew-rate limit published velocities ---
+        self.cmd_lin = 0.0
+        self.cmd_ang = 0.0
+        self.max_lin_step = 0.12
+        self.max_ang_step = 0.50   # snappier turning so it can change direction
+
+        # --- Stuck detection / escape ---
+        self.stuck_timer = 0
+        self.stuck_ref_x = 0.0
+        self.stuck_ref_y = 0.0
+        self.stuck_ref_set = False
+        self.win_intended = False     # did we try to move during this window?
+        self.stuck_count = 0
+        self.escape_ticks = 0
+        self.escape_turn = 1.0
+
+        # Game state
+        self.game_over = False
+
+        # Publisher / subscribers
         self.cmd_vel_pub = self.create_publisher(
-            Twist,
-            f'/{robot_name}/cmd_vel',
-            10
+            Twist, f'/{robot_name}/cmd_vel', 10
         )
-
-        # Subscribers
         self.create_subscription(
-            Odometry,
-            f'/{robot_name}/odom',
-            self.odom_callback,
-            10
+            ModelStates, '/gazebo/model_states', self.model_states_callback, 10
+        )
+        self.create_subscription(Bool, '/game_over', self.game_over_callback, 10)
+
+        self.create_timer(0.05, self.control_loop)   # 20 Hz
+
+        self._log_tick = 0
+        self.get_logger().info(
+            f'{robot_name}: attack goal x={self.target_goal_x:.0f}, '
+            f'defend goal x={self.own_goal_x:.0f} | aggression {self.aggression:.2f}'
         )
 
-        self.create_subscription(
-            ModelStates,
-            '/model_states',
-            self.model_states_callback,
-            10
-        )
-
-        # Main control timer
-        self.create_timer(0.1, self.control_loop)
-
-        self.get_logger().info(f'{robot_name} controller started')
-
-    # =========================================================
-    # ODOM CALLBACK
-    # =========================================================
-    def odom_callback(self, msg):
-
-        self.current_x = msg.pose.pose.position.x
-        self.current_y = msg.pose.pose.position.y
-
-        q = msg.pose.pose.orientation
-
+    # ---------------------------------------------------------------
+    # State input
+    # ---------------------------------------------------------------
+    @staticmethod
+    def yaw_from_quat(q):
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
 
-        self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+    def game_over_callback(self, msg):
+        if msg.data and not self.game_over:
+            self.game_over = True
+            self.get_logger().info(f'{self.robot_name}: game over - stopping.')
 
-    # =========================================================
-    # BALL POSITION CALLBACK
-    # =========================================================
     def model_states_callback(self, msg):
-
+        names = msg.name
         try:
-            index = msg.name.index('football_ball')
-
-            self.ball_x = msg.pose[index].position.x
-            self.ball_y = msg.pose[index].position.y
-
+            i = names.index(self.robot_name)
+            p = msg.pose[i]
+            self.current_x = p.position.x
+            self.current_y = p.position.y
+            self.current_yaw = self.yaw_from_quat(p.orientation)
+            self.have_pose = True
         except ValueError:
             pass
-
-        # Track opponent robot position
-        opponent_name = 'robot_red' if self.robot_name == 'robot_blue' else 'robot_blue'
         try:
-            index = msg.name.index(opponent_name)
-            self.opponent_x = msg.pose[index].position.x
-            self.opponent_y = msg.pose[index].position.y
+            i = names.index('football_ball')
+            self.ball_x = msg.pose[i].position.x
+            self.ball_y = msg.pose[i].position.y
+            self.have_ball = True
+        except ValueError:
+            pass
+        try:
+            i = names.index(self.opponent_name)
+            self.opponent_x = msg.pose[i].position.x
+            self.opponent_y = msg.pose[i].position.y
             self.opponent_detected = True
         except ValueError:
             self.opponent_detected = False
 
-    # =========================================================
-    # DETECT BALL
-    # =========================================================
-    def detect_ball(self):
-
-        dx = self.ball_x - self.current_x
-        dy = self.ball_y - self.current_y
-
-        self.ball_distance = math.sqrt(dx * dx + dy * dy)
-
-        angle = math.atan2(dy, dx)
-
-        self.ball_angle = angle - self.current_yaw
-
-        # Normalize angle
-        self.ball_angle = math.atan2(
-            math.sin(self.ball_angle),
-            math.cos(self.ball_angle)
+    def bearing_to(self, x, y):
+        """Relative bearing (rad) from the robot's heading to world point (x, y)."""
+        return normalize_angle(
+            math.atan2(y - self.current_y, x - self.current_x) - self.current_yaw
         )
 
-        self.ball_detected = self.ball_distance < 15.0
-
-    # =========================================================
-    # DETECT OPPONENT BLOCKING GOAL
-    # =========================================================
-    def is_opponent_blocking_goal(self):
-        if not self.opponent_detected:
-            return False
-        
-        # Calculate angle to goal
-        dx_goal = self.target_goal_x - self.current_x
-        dy_goal = self.target_goal_y - self.current_y
-        angle_to_goal = math.atan2(dy_goal, dx_goal)
-        
-        # Calculate angle to opponent
-        dx_opp = self.opponent_x - self.current_x
-        dy_opp = self.opponent_y - self.current_y
-        angle_to_opponent = math.atan2(dy_opp, dx_opp)
-        
-        # Calculate distance to opponent
-        dist_to_opponent = math.sqrt(dx_opp * dx_opp + dy_opp * dy_opp)
-        
-        # Check if opponent is in front and blocking path to goal
-        # Opponent is blocking if:
-        # 1. Within 5 meters
-        # 2. Angle to opponent is similar to angle to goal (within 30 degrees)
-        # 3. Opponent is closer to goal than we are
-        
-        angle_diff = abs(angle_to_opponent - angle_to_goal)
-        angle_diff = math.atan2(math.sin(angle_diff), math.cos(angle_diff))
-        
-        dist_to_goal = math.sqrt(dx_goal * dx_goal + dy_goal * dy_goal)
-        opp_dist_to_goal = math.sqrt(
-            (self.target_goal_x - self.opponent_x) ** 2 + 
-            (self.target_goal_y - self.opponent_y) ** 2
-        )
-        
-        blocking = (dist_to_opponent < 5.0 and 
-                    abs(angle_diff) < 0.5 and  # ~30 degrees
-                    opp_dist_to_goal < dist_to_goal)
-        
-        return blocking
-
-    # =========================================================
-    # MOVE TO BALL WITH POSITIONING STATE MACHINE
-    # =========================================================
-    def move_to_ball(self):
-
+    def publish_smoothed(self, target_lin, target_ang):
+        """Move current command toward the target by a bounded step, then publish."""
+        self.cmd_lin += clamp(target_lin - self.cmd_lin, -self.max_lin_step, self.max_lin_step)
+        self.cmd_ang += clamp(target_ang - self.cmd_ang, -self.max_ang_step, self.max_ang_step)
         twist = Twist()
+        twist.linear.x = self.cmd_lin
+        twist.angular.z = self.cmd_ang
+        self.cmd_vel_pub.publish(twist)
 
-        # =========================================================
-        # STATE: COOLDOWN (after kick, stop action)
-        # =========================================================
-        if self.kick_cooldown > 0:
-            self.kick_cooldown -= 1
-            twist.linear.x = 0.0
-            twist.angular.z = 0.0
-            self.ball_detected = False
-            self.cmd_vel_pub.publish(twist)
-            
-            # Exit cooldown and return to approaching
-            if self.kick_cooldown == 0:
-                self.kick_state = 'approaching'
-            return
-
-        # =========================================================
-        # STATE: KICKING (forward motion with force)
-        # =========================================================
-        if self.kick_state == 'kicking':
-            self.kick_timer += 1
-
-            if self.kick_timer > 5:  # Kick for 5 ticks
-                # Kick complete, enter cooldown
-                self.kick_timer = 0
-                self.kick_cooldown = 100
-                self.ball_detected = False
-                twist.linear.x = 0.0
-                twist.angular.z = 0.0
-
-            else:
-                # Strong forward kick
-                twist.linear.x = self.kick_speed * 3.0
-                twist.angular.z = 0.0
-
-            self.cmd_vel_pub.publish(twist)
-            return
-
-        # =========================================================
-        # STATE: READY_TO_KICK (centered and aligned - now kick!)
-        # =========================================================
-        if self.kick_state == 'ready_to_kick':
-            twist.linear.x = 0.0
-            twist.angular.z = 0.0
-            self.cmd_vel_pub.publish(twist)
-            
-            # Transition to kicking
-            self.kick_state = 'kicking'
-            self.kick_timer = 0
-            return
-
-        # =========================================================
-        # STATE: POSITIONING (fine-tune angle and distance)
-        # =========================================================
-        if self.kick_state == 'positioning':
-            if not self.ball_detected:
-                # Lost ball, go back to approaching
-                self.kick_state = 'approaching'
-                twist.angular.z = self.angular_speed * 0.5
-                twist.linear.x = 0.0
-                self.cmd_vel_pub.publish(twist)
-                return
-
-            # Check if properly centered
-            angle_ok = abs(self.ball_angle) < self.angle_tolerance
-            distance_ok = 0.4 < self.ball_distance < 1.0
-
-            if angle_ok and distance_ok:
-                # Check if opponent is blocking the goal
-                if self.is_opponent_blocking_goal():
-                    self.get_logger().info(
-                        f'{self.robot_name}: Opponent blocking goal! Entering CARRY state.'
-                    )
-                    self.kick_state = 'carrying'
-                    self.carry_timer = 0
-                    # Choose random carry angle (left or right)
-                    self.carry_angle = random.choice([0.5, -0.5])  # ~30 degrees
-                    twist.linear.x = 0.0
-                    twist.angular.z = 0.0
-                    self.cmd_vel_pub.publish(twist)
-                    return
-                else:
-                    # Properly positioned! Ready to kick
-                    self.get_logger().info(
-                        f'{self.robot_name}: Ball centered. Angle: {self.ball_angle:.3f}, '
-                        f'Distance: {self.ball_distance:.3f}. KICKING NOW!'
-                    )
-                    self.kick_state = 'ready_to_kick'
-                    twist.linear.x = 0.0
-                    twist.angular.z = 0.0
-                    self.cmd_vel_pub.publish(twist)
-                    return
-
-            # Still positioning - fine adjustments
-            
-            # If angle is off, rotate first
-            if abs(self.ball_angle) > self.angle_tolerance:
-                angular_speed = self.angular_speed * self.ball_angle * 0.5  # Slower rotation
-                angular_speed = max(min(angular_speed, 0.5), -0.5)  # Clamp for precision
-                twist.angular.z = angular_speed
-                twist.linear.x = 0.05  # Tiny forward motion
-                
-                self.get_logger().debug(
-                    f'{self.robot_name}: Positioning - turning. Angle: {self.ball_angle:.3f}'
-                )
-
-            # If distance is off, adjust forward/backward
-            elif self.ball_distance < 0.4:
-                # Too close, back up slightly
-                twist.linear.x = -0.1
-                twist.angular.z = 0.0
-                self.get_logger().debug(
-                    f'{self.robot_name}: Positioning - too close, backing up. Distance: {self.ball_distance:.3f}'
-                )
-
-            elif self.ball_distance > 1.0:
-                # Too far, move forward
-                twist.linear.x = self.linear_speed * 0.3
-                twist.angular.z = 0.0
-                self.get_logger().debug(
-                    f'{self.robot_name}: Positioning - moving closer. Distance: {self.ball_distance:.3f}'
-                )
-
-            else:
-                # Distance is good, just wait
-                twist.linear.x = 0.0
-                twist.angular.z = 0.0
-
-            self.cmd_vel_pub.publish(twist)
-            return
-
-        # =========================================================
-        # STATE: CARRYING (dribble ball at angle to avoid blocker)
-        # =========================================================
-        if self.kick_state == 'carrying':
-            self.carry_timer += 1
-            
-            # Carry for 30 ticks (3 seconds) then kick
-            if self.carry_timer > 30:
-                self.get_logger().info(
-                    f'{self.robot_name}: Carry complete. Kicking towards goal!'
-                )
-                self.kick_state = 'ready_to_kick'
-                twist.linear.x = 0.0
-                twist.angular.z = 0.0
-                self.cmd_vel_pub.publish(twist)
-                return
-            
-            # Move at angle while keeping ball close
-            # Slow forward motion with angular component
-            twist.linear.x = self.linear_speed * 0.4
-            twist.angular.z = self.carry_angle * 0.3
-            
-            self.cmd_vel_pub.publish(twist)
-            return
-
-        # =========================================================
-        # STATE: APPROACHING (move towards ball)
-        # =========================================================
-        if self.kick_state == 'approaching':
-            if not self.ball_detected:
-                # Search for ball
-                twist.angular.z = self.angular_speed * 0.5
-                twist.linear.x = 0.0
-                self.cmd_vel_pub.publish(twist)
-                return
-
-            # Turn towards ball first
-            if abs(self.ball_angle) > 0.2:
-                angular_speed = self.angular_speed * self.ball_angle
-                angular_speed = max(min(angular_speed, 1.0), -1.0)
-                twist.angular.z = angular_speed
-                twist.linear.x = 0.1
-                
-            # Approaching distance
-            elif self.ball_distance > 1.0:
-                twist.linear.x = self.linear_speed
-                twist.angular.z = 0.0
-                
-            # Getting close - transition to positioning
-            elif self.ball_distance <= 1.0:
-                self.get_logger().info(
-                    f'{self.robot_name}: Close to ball ({self.ball_distance:.3f}m). '
-                    f'Entering POSITIONING state for precise centering.'
-                )
-                self.kick_state = 'positioning'
-                twist.linear.x = 0.0
-                twist.angular.z = 0.0
-                self.cmd_vel_pub.publish(twist)
-                return
-
-            self.cmd_vel_pub.publish(twist)
-            return
-
-    # =========================================================
-    # CONTROL LOOP
-    # =========================================================
+    # ---------------------------------------------------------------
+    # Control
+    # ---------------------------------------------------------------
     def control_loop(self):
+        # Game over: glide to a stop.
+        if self.game_over:
+            self.publish_smoothed(0.0, 0.0)
+            return
 
-        self.detect_ball()
-        self.move_to_ball()
+        # Escape maneuver in progress: back up while turning to break free.
+        if self.escape_ticks > 0:
+            self.escape_ticks -= 1
+            self.publish_smoothed(-0.5, self.escape_turn)
+            return
+
+        # No data yet: spin and creep to look around.
+        if not self.have_pose or not self.have_ball:
+            self.publish_smoothed(0.1, 1.2)
+            return
+
+        # Re-roll a sprint/ease multiplier periodically.
+        self.burst_ticks -= 1
+        if self.burst_ticks <= 0:
+            self.burst_mult = random.uniform(0.85, 1.35)
+            self.burst_ticks = random.randint(20, 60)
+
+        bx, by = self.ball_x, self.ball_y
+        gx, gy = self.target_goal_x, self.target_goal_y
+
+        dist_ball = math.hypot(bx - self.current_x, by - self.current_y)
+
+        # Stand-off point sits behind the ball, away from the opponent goal,
+        # so driving forward from it sends the ball goalward.
+        ball_to_goal = math.atan2(gy - by, gx - bx)
+        approach_x = bx - math.cos(ball_to_goal) * self.approach_offset
+        approach_y = by - math.sin(ball_to_goal) * self.approach_offset
+
+        robot_to_ball = math.atan2(by - self.current_y, bx - self.current_x)
+        alignment = normalize_angle(robot_to_ball - ball_to_goal)
+
+        bearing_ball = self.bearing_to(bx, by)
+        aligned = abs(alignment) < self.strike_align
+        close = dist_ball < self.strike_distance
+
+        # Situational speed shaping.
+        if dist_ball > 3.0:
+            pace = 1.25
+        elif dist_ball > 1.5:
+            pace = 1.0
+        else:
+            pace = 0.8
+        chase = 1.0
+        if self.opponent_detected:
+            d_opp_ball = math.hypot(bx - self.opponent_x, by - self.opponent_y)
+            chase = 1.15 if dist_ball <= d_opp_ball else 0.9
+
+        lin = self.base_linear * self.burst_mult * pace * chase
+        ang = self.base_angular * self.burst_mult
+
+        if aligned and close and abs(bearing_ball) < 0.6:
+            # STRIKE: drive through the ball toward the opponent goal.
+            if self.mode != 'strike':
+                self.kick_power = self.base_strike * random.uniform(0.9, 1.3)
+                self.mode = 'strike'
+            self.seek_ticks = 0
+            self.charge_ticks = 0
+            target_lin = self.kick_power
+            target_ang = clamp(ang * bearing_ball, -1.5, 1.5)
+            self._log(f'STRIKE dist={dist_ball:.2f} power={self.kick_power:.2f}')
+        else:
+            # SEEK: pursue the ball, then line up behind it.
+            self.mode = 'seek'
+            self.seek_ticks += 1
+
+            # Unable to strike for a long time: charge the ball directly to
+            # shake it loose and change its direction.
+            if self.seek_ticks > 120 and self.charge_ticks == 0:
+                self.charge_ticks = 25
+                self.seek_ticks = 0
+                self._log('charging the ball to change its direction')
+
+            if self.charge_ticks > 0:
+                self.charge_ticks -= 1
+                tgt_x, tgt_y, charging = bx, by, True
+            elif dist_ball > 2.0:
+                # Far away: head straight for the ball to close the gap fast.
+                tgt_x, tgt_y, charging = bx, by, False
+            else:
+                # Close: aim for the stand-off point behind the ball.
+                tgt_x, tgt_y, charging = approach_x, approach_y, False
+
+            bearing_t = self.bearing_to(tgt_x, tgt_y)
+            target_ang = clamp(ang * bearing_t, -ang, ang)
+            target_lin = lin if abs(bearing_t) < 0.6 else 0.2
+            if charging:
+                target_lin = self.base_strike
+            elif dist_ball < 0.6:
+                # Don't shove the ball while circling behind it (own-goal guard).
+                target_lin = min(target_lin, 0.12)
+            self._log(f'SEEK dist={dist_ball:.2f} lin={target_lin:.2f}')
+
+        # Opponent avoidance: steer away and ease off so they don't ram.
+        if self.opponent_detected:
+            d_opp = math.hypot(
+                self.opponent_x - self.current_x, self.opponent_y - self.current_y
+            )
+            bearing_opp = self.bearing_to(self.opponent_x, self.opponent_y)
+            if d_opp < 1.3 and abs(bearing_opp) < 0.8:
+                target_ang += -1.4 if bearing_opp >= 0 else 1.4
+                target_lin = min(target_lin, 0.4)
+
+        self.update_stuck_detection(target_lin)
+        self.publish_smoothed(target_lin, target_ang)
+
+    def update_stuck_detection(self, target_lin):
+        """If we keep commanding motion but barely move, trigger an escape."""
+        if abs(target_lin) > 0.25:
+            self.win_intended = True
+
+        if not self.stuck_ref_set:
+            self.stuck_ref_x = self.current_x
+            self.stuck_ref_y = self.current_y
+            self.stuck_ref_set = True
+
+        self.stuck_timer += 1
+        if self.stuck_timer >= 10:   # check every ~0.5 s
+            moved = math.hypot(
+                self.current_x - self.stuck_ref_x,
+                self.current_y - self.stuck_ref_y,
+            )
+            if self.win_intended and moved < 0.1:
+                self.stuck_count += 1
+            else:
+                self.stuck_count = 0
+
+            if self.stuck_count >= 2:   # ~1 s of trying but not moving
+                self.escape_ticks = 30  # ~1.5 s back-up-and-turn
+                self.escape_turn = random.choice([-1.0, 1.0]) * 1.6
+                self.stuck_count = 0
+                self.get_logger().info(f'{self.robot_name}: stuck - escaping.')
+
+            self.stuck_ref_x = self.current_x
+            self.stuck_ref_y = self.current_y
+            self.win_intended = False
+            self.stuck_timer = 0
+
+    def _log(self, text):
+        self._log_tick += 1
+        if self._log_tick % 40 == 0:
+            self.get_logger().info(f'{self.robot_name}: {text}')
 
 
-# =============================================================
-# MAIN
-# =============================================================
 def main(args=None):
-
     rclpy.init(args=args)
 
     robot_blue = RobotController('robot_blue')
     robot_red = RobotController('robot_red')
 
     executor = MultiThreadedExecutor()
-
     executor.add_node(robot_blue)
     executor.add_node(robot_red)
 
     try:
         executor.spin()
-
     except KeyboardInterrupt:
         pass
-
     finally:
-
         robot_blue.destroy_node()
         robot_red.destroy_node()
-
         rclpy.shutdown()
 
 
